@@ -1,4 +1,13 @@
 # CUDA-union-find-decoder
 # CUDA-union-find-decoder
 
-Read me
+Build instructions:
+./build.sh
+
+Run instructions:
+
+For CPU:
+./toric_cpu
+
+For gpu:
+./toric_gpu
