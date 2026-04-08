@@ -3,18 +3,18 @@
 #include <array>
 #include <iostream>
 
+#define mask 0x7FFFFFFF
+
 using namespace std;
 
 inline
 cudaError_t checkCuda(cudaError_t result)
 {
-    #if defined(DEBUG) || defined(_DEBUG)
-        if (result != cudaSuccess)
+    if (result != cudaSuccess)
         {
-            f//printf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(result));
+            printf("CUDA Runtime Error: %s\n", cudaGetErrorString(result));
             assert(result == cudaSuccess);
         }
-    #endif
     return result;
 }
 
@@ -68,7 +68,8 @@ __global__ void get_syndromes(int* edges, int* parity)
 
 __global__ void grow_cluster(int* parent, int* parity, int* output)
 {
-    __shared__ int l_parent[L][L+1];
+    __shared__ unsigned int l_parent[L][L+1];
+    __shared__ int locks[L][L+1];
     __shared__ u_int8_t l_parity[L][L+1];
     __shared__ u_int8_t l_output[2*L][L+1];
 
@@ -78,8 +79,8 @@ __global__ void grow_cluster(int* parent, int* parity, int* output)
     {
         int x = i % L;
         int y = int(i / L);
-        l_parent[y][x] = parent[i];
-        l_parity[y][x] = parity[i];
+        l_parent[y][x] = parent[i] | (parity[i] << 31);
+        locks[y][x] = 0;
     }
 
     for (int i = idx; i < 2*L*L; i += stride)
@@ -99,44 +100,37 @@ __global__ void grow_cluster(int* parent, int* parity, int* output)
         {
             has_odd = 0;
         }
+        
         //path compression
         for (int i = idx; i < L*L; i += stride)
         {
             int x = i % L;
             int y = int(i / L);
-            int parent_idx = l_parent[y][x];
-            int x2 = parent_idx % L;
-            int y2 = int(parent_idx / L);
-            int p = l_parent[y2][x2];
-            if (p != parent_idx)
+            int parent_idx = l_parent[y][x] & mask;
+            int p = parent_idx;
+            do
             {
-                parent[i] = p;
-                l_parent[y][x] = p;
-            }
-        }
-
-        for (int i = idx; i < L*L; i += stride)
-        {
-            if (l_parent[int(i / L)][i % L] == i)
-            {
-                if (l_parity[int(i / L)][i % L])
+            
+                int x2 = p % L;
+                int y2 = int(p / L);
+                p = l_parent[y2][x2] & mask;
+                if (p == y2*L + x2)
                 {
-                    atomicOr(&has_odd, 1);
+                    p = l_parent[y2][x2];
+                    break;
                 }
-            }
+            } while (true);
+            l_parent[y][x] = p;
+            locks[y][x] = 0;
         }
-
-        if (!has_odd)
-        {
-            break;
-        }
-
+        __syncthreads();
+        
         //cluster handling
         for (int i = idx; i < L*L; i += stride)
         {
             int x = i % L;
             int y = int(i / L);
-            int p = l_parent[y][x];
+            int p = l_parent[y][x] & mask;
             int n_e[8];
             n_e[0] = (x+1 + L) % L;
             n_e[1] = y;
@@ -154,134 +148,143 @@ __global__ void grow_cluster(int* parent, int* parity, int* output)
             n_edge[3] = (x + (2*y-1 + 2*L) % (2*L)*L);
 
             //figure out if boundary, and expand as needed
-            ////printf("%i\n", l_parity[int(p / L)][p % L]);
-            if (l_parity[int(p / L)][p % L] == 0)
+            if ((l_parent[int(p / L)][p % L] >> 31) == 0)
             {
-                //printf("We're actually not a syndrome %i\n", i);
-                continue;
+                //continue;
             }
             else
             {
-                //printf("I am a syndrome! %i %i\n", p, i);
+                //priority sweep
+                for (int j = 0; j < 8; j += 2)
+                {
+                    unsigned int parity1 = (l_parent[int(p / L)][p % L] >> 31);
+                    int p2 = l_parent[n_e[j+1]][n_e[j]] & mask;
+                    if (p2 != p && (l_parent[int(p2 / L)][p2 % L] >> 31))
+                    {
+                        int x2 = p2 % L;
+                        int y2 = int(p2 / L);
+                        unsigned int p3 = l_parent[y2][x2]; //parent node and parent value
+                        p3 = p3 & mask;
+                        x2 = p3 % L;
+                        y2 = int(p3 / L);
+
+                        unsigned int parity3 = l_parent[int(p3 / L)][p3 % L] >> 31;
+                        
+                        //get own parent location
+                        int px = p % L;
+                        int py = int(p / L);
+
+                        int small = min(p, p3);
+                        int big = max(p, p3);
+                        if (atomicCAS(&locks[int(small/L)][small % L], 0, 1) == 0)
+                        {
+                            if (atomicCAS(&locks[int(big/L)][big % L], 0, 1) == 0)
+                            {
+                                parity1 = l_parent[int(p/L)][p%L]>>31;
+                                parity3 = l_parent[int(p3/L)][p3%L]>>31;
+                                y2 = int(p3/L);
+                                x2 = p3%L;
+                                py = int(p/L);
+                                px = p%L;
+                                
+
+                                if (p < p3)
+                                {
+                                    //if parent is its own parent
+                                    if ((p3 | (parity3<<31)) == atomicCAS(&l_parent[y2][x2], p3 | (parity3<<31), p | ((parity3 ^ parity1)<<31)))
+                                    {
+                                        l_parent[py][px] = l_parent[y2][x2];
+                                        if (p != p3 && p != p2)
+                                        {
+                                            l_output[int(n_edge[j/2] / L)][n_edge[j/2] % L] = 3;
+                                            atomicOr(&has_odd, 1);
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    if ((p | (parity1<<31)) == atomicCAS(&l_parent[py][px], p | (parity1<<31), p3 | ((parity3 ^ parity1)<<31)))
+                                    {
+                                        l_parent[y2][x2] = l_parent[py][px];
+                                        if (p != p3 && p != p2)
+                                        {
+                                            l_output[int(n_edge[j/2] / L)][n_edge[j/2] % L] = 3;
+                                            atomicOr(&has_odd, 1);
+                                        }
+                                    }
+                                }
+                            }
+                            locks[int(small/L)][small % L] = 0;
+                        }
+                    }
+                }
+
+                //full sweep
+                for (int j = 0; j < 8; j += 2)
+                {
+                    unsigned int parity1 = (l_parent[int(p / L)][p % L] >> 31);
+                    int p2 = l_parent[n_e[j+1]][n_e[j]] & mask;
+                    if (p2 != p)
+                    {
+                        int x2 = p2 % L;
+                        int y2 = int(p2 / L);
+                        unsigned int p3 = l_parent[y2][x2]; //parent node and parent value
+                        p3 = p3 & mask;
+                        x2 = p3 % L;
+                        y2 = int(p3 / L);
+                        unsigned int parity3 = l_parent[int(p3 / L)][p3 % L] >> 31;
+                        
+                        //get own parent location
+                        int px = p % L;
+                        int py = int(p / L);
+
+                        int small = min(p, p3);
+                        int big = max(p, p3);
+                        if (atomicCAS(&locks[int(small/L)][small % L], 0, 1) == 0)
+                        {
+                            if (atomicCAS(&locks[int(big/L)][big % L], 0, 1) == 0)
+                            {
+                                parity1 = l_parent[int(p/L)][p%L]>>31;
+                                parity3 = l_parent[int(p3/L)][p3%L]>>31;
+                                y2 = int(p3/L);
+                                x2 = p3%L;
+                                py = int(p/L);
+                                px = p%L;
+
+                                if (p < p3)
+                                {
+                                    //if parent is its own parent
+                                    if ((p3 | (parity3<<31)) == atomicCAS(&l_parent[y2][x2], p3 | (parity3<<31), p | ((parity3 ^ parity1)<<31)))
+                                    {
+                                        l_parent[py][px] = l_parent[y2][x2];
+                                        if (p != p3 && p != p2)
+                                        {
+                                            l_output[int(n_edge[j/2] / L)][n_edge[j/2] % L] = 3;
+                                            atomicOr(&has_odd, 1);
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    if ((p | (parity1<<31)) == atomicCAS(&l_parent[py][px], p | (parity1<<31), p3 | ((parity3 ^ parity1)<<31)))
+                                    {
+                                        l_parent[y2][x2] = l_parent[py][px];
+                                        if (p != p3 && p != p2)
+                                        {
+                                            l_output[int(n_edge[j/2] / L)][n_edge[j/2] % L] = 3;
+                                            atomicOr(&has_odd, 1);
+                                        }
+                                    }
+                                }
+                            }
+                            locks[int(small/L)][small % L] = 0;
+                        }
+
+                    }
+                }
             }
-            //priority sweep
-            for (int j = 0; j < 8; j += 2)
-            {
-                if (p != l_parent[y][x])
-                {
-                    break;
-                }
-                if (l_parity[int(p / L)][p % L] == 0)
-                {
-                    //printf("I am no longer a syndrome %d\n", i);
-                    break;
-                }
-                int p2 = l_parent[n_e[j+1]][n_e[j]];
-                if (p2 != p && l_parity[int(p2 / L)][p2 % L])
-                {
-                    //printf("What's going on here bruh %i %i %i (%i %i) (%i %i)\n", p, p2, i, x, y, n_e[j], n_e[j+1]);
-                    int x2 = p2 % L;
-                    int y2 = int(p2 / L);
-                    int p3 = l_parent[y2][x2]; //parent node and parent value
-                    
-                    //get own parent location
-                    int px = p % L;
-                    int py = int(p / L);
 
-                    if (p < p3)
-                    {
-                        if (p3 == atomicCAS(&l_parent[y2][x2], p3, p))
-                        {
-                            //printf("Atomically CASing it %d %d %d %d\n", p, p3, i, j);
-                            //l_parity[py][px] ^= l_parity[y2][x2];
-                            //l_parity[y2][x2] = l_parity[py][px];
-                            l_parity[py][px] ^= l_parity[int(p3 / L)][p3 % L];
-                            l_parity[int(p3 / L)][p3 % L] = l_parity[py][px];
-                            if (p != p3)
-                            {
-                                l_output[int(n_edge[j/2] / L)][n_edge[j/2] % L] = 3;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        if (p == atomicCAS(&l_parent[py][px], p, p3))
-                        {
-                            //printf("Atomically CASing it %d %d %d %d\n", p, p3, i, j);
-                            //l_parity[y2][x2] ^= l_parity[py][px];
-                            //l_parity[py][px] = l_parity[y2][x2];
-                            l_parity[int(p3 / L)][p3 % L] ^= l_parity[py][px];
-                            l_parity[py][px] = l_parity[int(p3 / L)][p3 % L];
-                            if (p != p3)
-                            {
-                                l_output[int(n_edge[j/2] / L)][n_edge[j/2] % L] = 3;
-                            }
-                        }
-                    }
-                }
-            }
-
-            //full sweep
-            for (int j = 0; j < 8; j += 2)
-            {
-                if (p != l_parent[y][x])
-                {
-                    break;
-                }
-                if (l_parity[int(p / L)][p % L] == 0)
-                {
-                    //printf("I am no longer a syndrome %d\n", i);
-                    break;
-                }
-                int p2 = l_parent[n_e[j+1]][n_e[j]];
-                if (p2 != p)
-                {
-                    //printf("What's going on here bruh %i %i %i (%i %i) (%i %i)\n", p, p2, i, x, y, n_e[j], n_e[j+1]);
-                    int x2 = p2 % L;
-                    int y2 = int(p2 / L);
-                    int p3 = l_parent[y2][x2]; //parent node and parent value
-                    
-                    //get own parent location
-                    int px = p % L;
-                    int py = int(p / L);
-
-                    if (p < p3)
-                    {
-                        if (p3 == atomicCAS(&l_parent[y2][x2], p3, p))
-                        {
-                            //printf("Atomically CASing it %d %d %d %d\n", p, p3, i, j);
-                            //l_parity[py][px] ^= l_parity[y2][x2];
-                            //l_parity[y2][x2] = l_parity[py][px];
-                            l_parity[py][px] ^= l_parity[int(p3 / L)][p3 % L];
-                            l_parity[int(p3 / L)][p3 % L] = l_parity[py][px];
-                            //printf("What the heck %i %i %i\n", int(p3 / L), p3 % L, l_parity[int(p3 / L)][p3 % L]);
-                            //printf("What the heck %i %i %i\n", py, px, l_parity[py][px]);
-                            if (p != p3)
-                            {
-                                l_output[int(n_edge[j/2] / L)][n_edge[j/2] % L] = 3;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        if (p == atomicCAS(&l_parent[py][px], p, p3))
-                        {
-                            //printf("Atomically CASing it %d %d %d %d\n", p, p3, i, j);
-                            //l_parity[y2][x2] ^= l_parity[py][px];
-                            //l_parity[py][px] = l_parity[y2][x2];
-                            l_parity[int(p3 / L)][p3 % L] ^= l_parity[py][px];
-                            l_parity[py][px] = l_parity[int(p3 / L)][p3 % L];
-                            //printf("What the heck %i %i %i\n", int(p3 / L), p3 % L, l_parity[int(p3 / L)][p3 % L]);
-                            //printf("What the heck %i %i %i\n", py, px, l_parity[py][px]);
-                            if (p != p3)
-                            {
-                                l_output[int(n_edge[j/2] / L)][n_edge[j/2] % L] = 3;
-                            }
-                        }
-                    }
-                }
-            }
-
+            __syncthreads();
         }
 
         __syncthreads();
@@ -290,19 +293,13 @@ __global__ void grow_cluster(int* parent, int* parity, int* output)
 
     __syncthreads();
 
-    __shared__ int max;
     for (int i = idx; i < L*L; i += stride)
     {
         int x = i % L;
         int y = int(i / L);
         l_parity[y][x] = parity[i];
     }
-
-    if (idx == 0)
-    {
-        max = 10;
-    }
-
+    
     do
     {
         //peeling
@@ -316,7 +313,6 @@ __global__ void grow_cluster(int* parent, int* parity, int* output)
         if (threadIdx.x == 0 && threadIdx.y == 0)
         {
             has_odd = 0;
-            max--;
         }
         __syncthreads();
 
@@ -328,21 +324,17 @@ __global__ void grow_cluster(int* parent, int* parity, int* output)
             };
         }
 
-        if (!has_odd || max <= 0)
+        __syncthreads();
+
+        if (!has_odd)
         {
-            //printf("%i", threadIdx.x);
             break;
-        }
-        else
-        {
-            //printf("Not quite there yet\n");
         }
 
         for (int i = idx; i < L*L; i += stride)
         {
             int x = i % L;
             int y = int(i / L);
-            int p = l_parent[y][x];
             int n_e[8];
             n_e[0] = (x+1 + L) % L;
             n_e[1] = y;
@@ -373,42 +365,52 @@ __global__ void grow_cluster(int* parent, int* parity, int* output)
                 {
                     if (l_output[int(n_edge[j] / L)][n_edge[j] % L] == 3)
                     {
-                        if (0 == atomicCAS(&l_parent[n_e[2*j+1]][n_e[2*j]], 0, 1))
+                        int i1 = y*L + x;
+                        int i2 = n_e[2*j+1]*L + n_e[2*j];
+                        int small = min(i1, i2);
+                        int big = max(i1, i2);
+                        if (0 == atomicCAS(&l_parent[int(small / L)][small % L], 0, 1))
                         {
-                            if (l_parity[y][x] == 1)
+                            if (0 == atomicCAS(&l_parent[int(big / L)][big % L], 0, 1))
                             {
-                                l_parity[y][x] = 0;
-                                l_parity[n_e[2*j+1]][n_e[2*j]] ^= 1;
-                                l_output[int(n_edge[j] / L)][n_edge[j] % L] = 1;
-                            }
-                            else
-                            {
-                                l_output[int(n_edge[j] / L)][n_edge[j] % L] = 0;
+                                if (l_parity[y][x])
+                                {
+                                    l_parity[y][x] ^= 1;
+                                    l_parity[n_e[2*j+1]][n_e[2*j]] ^= 1;
+                                    l_output[int(n_edge[j] / L)][n_edge[j] % L] = 1;
+                                }
+                                else
+                                {
+                                    l_output[int(n_edge[j] / L)][n_edge[j] % L] = 0;
+                                }
+                                l_parent[n_e[2*j+1]][n_e[2*j]] = 0;
                             }
                         }
                     }
                 }
             }
         }
-
-        for (int i = idx; i < L*L; i += stride)
-        {
-            ////printf("%i %i %i\n", int(i/L), i%L, l_parity[int(i / L)][i % L]);
-            parity[i] = l_parity[int(i / L)][i % L];
-            parent[i] = l_parent[int(i / L)][i % L];
-        }
-        for (int i = idx; i < 2*L*L; i+= stride)
-        {
-            output[i] = l_output[int(i / L)][i % L];
-        }
         __syncthreads();
+        
     } while (has_odd);
+
+    //__syncthreads();
+
+    for (int i = idx; i < L*L; i += stride)
+    {
+        parity[i] = l_parity[int(i / L)][i % L];
+        parent[i] = l_parent[int(i / L)][i % L] & mask;
+    }
+    for (int i = idx; i < 2*L*L; i+= stride)
+    {
+        output[i] = l_output[int(i / L)][i % L];
+    }
 }
 
 void set_errors(int* qubits, int* parity, double error_rate)
 {
     //set qubit errors
-    /*for (int i = 0; i < 2*L*L; i++)
+    for (int i = 0; i < 2*L*L; i++)
     {
         if (double(rand())/RAND_MAX < error_rate)
         {
@@ -418,22 +420,7 @@ void set_errors(int* qubits, int* parity, double error_rate)
         {
             qubits[i] = 0;
         }
-    }//*/
-   //qubits[13] = 1;
-   
-   /*qubits[11] = 1;
-   qubits[18] = 1;
-   qubits[19] = 1;*/
-
-   //qubits[0] = 1;
-   //qubits[6] = 1;
-   //qubits[9] = 1;
-   //qubits[49] = 1;
-
-   qubits[24] = 1;
-   qubits[27] = 1;
-   qubits[37] = 1;
-   qubits[46] = 1;
+    }
 
 
     //set syndromes
@@ -455,15 +442,6 @@ void set_errors(int* qubits, int* parity, double error_rate)
 
         
         parity[i] = n % 2;
-        /*if (x == 4 && y == 4)
-        {
-            parity[x+y*L] = 3;
-            for (int j = 0; j < 4; j++)
-            {
-                cout<<n_e[j]<<" "<<x<<" "<<y<<endl;
-                qubits[n_e[j]] = 5;
-            }
-        }*/
     }
 
 }
@@ -490,7 +468,6 @@ void display(int* vertices, int* edges)
             if (vertices[int(y/2)*L + x])
             {
                 c = 'X';
-                //c = char(vertices[int(y/2)*L + x]);
             }
             cout<<c<<"--"<<edges[y*L+x]<<"--";
         }
@@ -555,9 +532,8 @@ void checkResults(int* in, int* ans, int size)
 
 int main()
 {
-    srand(time(NULL));
-    init_input();
-
+    int iter = 500;
+    float t_millis = 0;
     int* d_parity;
     int* d_edges;
     int* d_parent;
@@ -569,92 +545,100 @@ int main()
     checkCuda ( cudaMalloc((void**)&d_edges, 2*bytes));
     checkCuda ( cudaMalloc((void**)&d_parent, bytes));
     checkCuda ( cudaMalloc((void**)&d_output, 2*bytes));
-    checkCuda( cudaMemcpy(d_parity, parity, bytes, cudaMemcpyHostToDevice) );
-    checkCuda( cudaMemcpy(d_edges, edges, 2*bytes, cudaMemcpyHostToDevice) );
-    checkCuda( cudaMemcpy(d_parent, parent, bytes, cudaMemcpyHostToDevice) );
-    checkCuda( cudaMemcpy(d_output, output, 2*bytes, cudaMemcpyHostToDevice) );  
+    for (int k = 0; k < iter; k++)
+    {
+        unsigned int seed = time(NULL) + k;
+        //unsigned int seed = 1775658110;
+        //cout<<"Seed: "<<seed<<endl;
+        srand(seed);
+        init_input();
 
-    const int nReps = 20;
-    float milliseconds;
-    cudaEvent_t startEvent, stopEvent;
-    checkCuda( cudaEventCreate(&startEvent) );
-    checkCuda( cudaEventCreate(&stopEvent) );
+        float milliseconds;
+        cudaEvent_t startEvent, stopEvent;
+        checkCuda( cudaEventCreate(&startEvent) );
+        checkCuda( cudaEventCreate(&stopEvent) );
+        checkCuda( cudaMemcpy(d_parity, parity, bytes, cudaMemcpyHostToDevice) );
+        checkCuda( cudaMemcpy(d_edges, edges, 2*bytes, cudaMemcpyHostToDevice) );
+        checkCuda( cudaMemcpy(d_parent, parent, bytes, cudaMemcpyHostToDevice) );
+        checkCuda( cudaMemcpy(d_output, output, 2*bytes, cudaMemcpyHostToDevice) );  
 
-    get_syndromes<<<grid, block>>>(d_edges, d_parity);
-
-    
-    for (int i = 0; i < nReps; i++)
         get_syndromes<<<grid, block>>>(d_edges, d_parity);
 
-    checkCuda( cudaMemcpy(parity, d_parity, bytes, cudaMemcpyDeviceToHost) );
+        checkCuda( cudaMemcpy(parity, d_parity, bytes, cudaMemcpyDeviceToHost) );
 
-    checkResults(parity, ans_parity, L*L);
-
-    //printf("   Average Bandwidth (GB/s): %f\n\n", 1e-6 * bytes * nReps / milliseconds);
+        checkResults(parity, ans_parity, L*L);
 
 
-    display(parity, edges);
-    cout<<"-------------------------------------"<<endl;
-    char c = 'a';
-    //while (c != 'q')
-    //{
-    checkCuda( cudaEventRecord(startEvent, 0) );
-    grow_cluster<<<grid, block>>>(d_parent, d_parity, d_output);
-    checkCuda( cudaDeviceSynchronize() );
-    checkCuda( cudaEventRecord(stopEvent, 0) );
-    checkCuda( cudaEventSynchronize(stopEvent) );
-    checkCuda( cudaEventElapsedTime(&milliseconds, startEvent, stopEvent) );
+        //display(parity, edges);
+        checkCuda( cudaEventRecord(startEvent, 0) );
+        grow_cluster<<<grid, block>>>(d_parent, d_parity, d_output);
+        checkCuda( cudaDeviceSynchronize() );
+        checkCuda( cudaEventRecord(stopEvent, 0) );
+        checkCuda( cudaEventSynchronize(stopEvent) );
+        checkCuda( cudaEventElapsedTime(&milliseconds, startEvent, stopEvent) );
 
-    checkCuda( cudaMemcpy(parent, d_parent, bytes, cudaMemcpyDeviceToHost) );
-    checkCuda( cudaMemcpy(parity, d_parity, bytes, cudaMemcpyDeviceToHost) );
-    checkCuda( cudaMemcpy(output, d_output, 2*bytes, cudaMemcpyDeviceToHost) );
-    
-
-
-    /*display(ans_parity, edges);
-    cout<<"-------------------------------------"<<endl;
-    display(parity, edges);*/
-    display2(parent, output);
-    cout<<"-------------------------------------"<<endl;
-    display(parity, edges);
-    cout<<"Milliseconds: "<<milliseconds<<endl;
-
-    for (int i = 0; i < 2*L*L; i++)
-    {
-        if (output[i] == 1)
-        {
-            edges[i] ^= output[i];
-        }
-    }
-    for (int i = 0; i < L*L; i++)
-    {
-        parity[i] = 0;
-    }
-
-    for (int i = 0; i < L*L; i++)
-    {
-        //calculate neighbors
-        int x = i % L;
-        int y = int(i / L);
-        int n_e[4];
-        n_e[0] = (x + 2*y*L);
-        n_e[1] = (((x-1 + L) % L) + 2*y*L);
-        n_e[2] = (x + ((2*y+1 + 2*L) % (2*L))*L);
-        n_e[3] = (x + ((2*y-1 + 2*L) % (2*L))*L);
-        int n = 0;
-        for (int j = 0; j < 4; j++)
-        {
-            n += edges[n_e[j]];
-        }
-
+        checkCuda( cudaMemcpy(parent, d_parent, bytes, cudaMemcpyDeviceToHost) );
+        checkCuda( cudaMemcpy(parity, d_parity, bytes, cudaMemcpyDeviceToHost) );
+        checkCuda( cudaMemcpy(output, d_output, 2*bytes, cudaMemcpyDeviceToHost) );
         
-        if (n%2)
+
+
+        //uncomment for debug output
+        /*display(ans_parity, edges);
+        cout<<"-------------------------------------"<<endl;
+        display(parity, edges);
+        display2(parent, output);
+        cout<<"-------------------------------------";*/
+        for (int i = 0; i < 2*L*L; i++)
         {
-            cout<<"Ruh roh scoobs"<<i<<endl;
+            if (output[i] == 1)
+            {
+                edges[i] ^= output[i];
+            }
         }
-        parity[i] = n%2;
+        //display(parity, edges);
+        //cout<<"Milliseconds: "<<milliseconds<<" seed: "<<seed<<endl;
+        t_millis += milliseconds;
+        for (int i = 0; i < L*L; i++)
+        {
+            parity[i] = 0;
+        }
+
+        for (int i = 0; i < L*L; i++)
+        {
+            //calculate neighbors
+            int x = i % L;
+            int y = int(i / L);
+            int n_e[4];
+            n_e[0] = (x + 2*y*L);
+            n_e[1] = (((x-1 + L) % L) + 2*y*L);
+            n_e[2] = (x + ((2*y+1 + 2*L) % (2*L))*L);
+            n_e[3] = (x + ((2*y-1 + 2*L) % (2*L))*L);
+            int n = 0;
+            for (int j = 0; j < 4; j++)
+            {
+                n += edges[n_e[j]];
+            }
+
+            
+            if (n%2)
+            {
+                cout<<"Issue in output found: "<<i<<" "<<k<<" "<<milliseconds<<" "<<seed<<endl;
+            }
+            parity[i] = n%2;
+        }
+        
+        //cleanup
+        cudaEventDestroy(startEvent);
+        cudaEventDestroy(stopEvent);
     }
-    //cout<<"Actual output"<<endl;
+    cudaFree(d_parity);
+    cudaFree(d_edges);
+    cudaFree(d_parent);
+    cudaFree(d_output);
+    cout<<"Lattice size: "<<L<<"x"<<L<<endl;
+    cout<<"Number of runs: "<<iter<<endl;
+    cout<<"Milliseconds per lattice: "<<t_millis/iter<<endl;
     //display(parity, edges);
         //cin>>c;
     //}

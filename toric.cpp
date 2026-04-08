@@ -541,31 +541,36 @@ int main()
     auto* old_buf = cout.rdbuf(null_stream.rdbuf());
 
     int iterations = 1000;
-    auto start_time = chrono::steady_clock::now();
+    double total_time = 0;
 
     for (int i = 0; i < iterations; i++)
     {
         ToricSimulator toric;
+        auto start_time = chrono::steady_clock::now();
         //cout<<"New toric: \n\n"<<endl;
-        toric.display2(toric.parent, toric.edges);
+        //toric.display2(toric.parent, toric.edges);
         //cout<<"------------------"<<endl;
-        toric.display(toric.parity, toric.qubits);
+        //toric.display(toric.parity, toric.qubits);
         //cout<<"------------------"<<endl;
 
         while (toric.iterate());
         toric.get_leaves();
         while (toric.peel());
+        
+        auto end_time = chrono::steady_clock::now();
+
+			  chrono::duration<double> time_passed = end_time - start_time;
+			  total_time += time_passed.count();
         //cout<<"---------------------------"<<endl;
-        toric.display2(toric.parent, toric.edges);
+        //toric.display2(toric.parent, toric.edges);
         //cout<<"Answer:"<<endl;
-        toric.display(toric.parity, toric.output);
+        //toric.display(toric.parity, toric.output);
 
     }
 
-    auto end_time = chrono::steady_clock::now();
-
-    chrono::duration<double> time_passed = end_time - start_time;
-
     cout.rdbuf(old_buf);
-    cout<<"Time passed: "<<time_passed.count()<<" seconds"<<endl;
+    cout<<"Time passed: "<<total_time<<" seconds"<<endl;
+    cout<<"Lattice size: "<<L<<"x"<<L<<endl;
+    cout<<"Iterations: "<<iterations<<endl;
+    cout<<"Millseconds per lattice: "<<total_time/iterations*1000<<endl;
 }
