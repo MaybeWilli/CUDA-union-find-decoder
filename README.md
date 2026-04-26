@@ -2,7 +2,7 @@
 
 GPU-accelerated quantum error correction code based on a parallelized version of the union-find decoder algorithm described Delfosse & Nickerson's 2017 paper “Almost-linear time decoding algorithm for topological codes” (https://arxiv.org/abs/1709.06218)
 
-Decoder's peeling step is based on Defosse and Zémor's 2020 paper "Linear-time maximum likelihood decoding of surface codes over the quantum erasure channel" (https://journals.aps.org/prresearch/abstract/10.1103/PhysRevResearch.2.033042)
+Decoder's peeling step is based on Delfosse and Zémor's 2020 paper "Linear-time maximum likelihood decoding of surface codes over the quantum erasure channel" (https://journals.aps.org/prresearch/abstract/10.1103/PhysRevResearch.2.033042)
 
 ## Build Instructions
 
